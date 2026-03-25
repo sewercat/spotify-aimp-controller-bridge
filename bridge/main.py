@@ -6,9 +6,11 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 
+from app_window import BridgeAppWindow, StreamMirror
 from config import load_config
 from spotify_client import SpotifyClient
 from aimp_controller import AIMPController
@@ -16,7 +18,6 @@ from aimp_hook import AIMPHook
 from metadata_writer import MetadataWriter
 from hotkey_handler import HotkeyHandler
 from playlist_syncer import PlaylistSyncer
-from sync_progress_window import SyncProgressWindow
 from tray_icon import TrayIcon
 
 
@@ -30,10 +31,12 @@ class SpotifyAIMPBridge:
         self.metadata  = MetadataWriter(self.config)
         self.playlists = PlaylistSyncer(self.spotify, self.metadata, self.config)
         self.hotkeys   = HotkeyHandler(self.spotify, self.config)
-        self.progress_window = SyncProgressWindow(
-            enabled=self.config.getboolean("bridge", "show_sync_window", fallback=True)
-        )
+        self.window    = BridgeAppWindow(self)
         self.tray      = TrayIcon(self)
+        self._stdout_original = sys.stdout
+        self._stderr_original = sys.stderr
+        self._stream_mirror_out: StreamMirror | None = None
+        self._stream_mirror_err: StreamMirror | None = None
 
         self._running = False
         self._last_track_id = None
@@ -41,6 +44,7 @@ class SpotifyAIMPBridge:
         self._last_aimp_state = None
         self._playlist_loaded = False
         self._track_id_to_wav: dict[str, str] = {}
+        self._track_id_to_playlist_id: dict[str, str] = {}
         self._track_map: dict[str, dict | str] = {}
         self._cached_playlists: dict[str, dict] = {}
         self._current_m3u8: str | None = None
@@ -51,21 +55,28 @@ class SpotifyAIMPBridge:
         self._aimp_click_deadline = 0.0
         self._aimp_click_serial = 0
         self._last_realign_attempt = 0.0
+        self._last_missing_track_resync_attempt = 0.0
+        self._resync_in_flight = False
         self._last_spotify_present = False
         self._last_aimp_running = False
         self._last_presence_sync = 0.0
         self._last_reconcile_to_spotify_attempt = 0.0
+        self._status_mismatch_streak = 0
+        self._sync_op_lock = threading.RLock()
+        self._clear_in_progress = False
 
     def start(self):
         print("[Bridge] Starting...")
-        self._running = True
 
         print("[Bridge] Authenticating with Spotify...")
         _ = self.spotify.get_current_state()
         print("[Bridge] Spotify OK")
 
+        self.window.start()
+        self._install_log_mirror()
+        self._running = True
+
         self.hotkeys.register()
-        self.progress_window.start()
         self.hook.set_on_aimp_click(self._on_aimp_click)
         threading.Thread(target=self._initial_sync,       name="InitialSync",   daemon=True).start()
         threading.Thread(target=self._sync_loop,          name="SyncLoop",      daemon=True).start()
@@ -78,16 +89,180 @@ class SpotifyAIMPBridge:
         print("[Bridge] Running -- tray icon active, media keys -> Spotify")
         print("[Bridge] Right-click the tray icon to sync playlists or exit.\n")
         self.tray.run()
+        self.window.wait_until_closed()
 
     def stop(self):
         print("[Bridge] Stopping...")
+        try:
+            self.spotify.pause()
+        except Exception:
+            pass
         self._running = False
-        self.progress_window.close()
         self.hook.uninstall()
         self.hotkeys.unregister()
+        self.window.close()
+        import os as _os
+        _os._exit(0)
+
+    def _install_log_mirror(self):
+        self._stream_mirror_out = StreamMirror(self._stdout_original, self.window, passthrough=False)
+        self._stream_mirror_err = StreamMirror(self._stderr_original, self.window, passthrough=False)
+        sys.stdout = self._stream_mirror_out
+        sys.stderr = self._stream_mirror_err
+
+    def _restore_streams(self):
+        if sys.stdout is not self._stdout_original:
+            sys.stdout = self._stdout_original
+        if sys.stderr is not self._stderr_original:
+            sys.stderr = self._stderr_original
+
+    def manual_sync_current_playlist(self):
+        def run():
+            if self._clear_in_progress:
+                print("[Bridge] Manual sync skipped: clear-all in progress.")
+                return
+            pl_id = self._get_current_playlist_id()
+            if not pl_id:
+                print("[Bridge] Manual sync skipped: no current playlist context.")
+                return
+            result = self._sync_playlist_id(pl_id, force=True)
+            if result:
+                self._activate_playlist_result(result, allow_create=True)
+                print(f"[Bridge] Manual sync done: {result.get('playlist_name', 'Playlist')}")
+        threading.Thread(target=run, name="ManualSync", daemon=True).start()
+
+    def clear_all_cache_data(self):
+        threading.Thread(target=self._clear_all_cache_data_worker, name="ClearAllData", daemon=True).start()
+
+    def _clear_all_cache_data_worker(self):
+        if self._clear_in_progress:
+            print("[Bridge] Clear-all already in progress, skipping duplicate request.")
+            return
+        self._clear_in_progress = True
+        print("[Bridge] Clear-all requested: stopping sync state and wiping cache/data...")
+        self.hook.suppress(6.0)
+
+        try:
+            with self._sync_op_lock:
+                wav_root = getattr(self.playlists, "wav_root", None)
+                pls_dir = getattr(self.playlists, "pls_dir", None)
+
+                # Build a conservative list of bridge-generated playlist names.
+                generated_names = set()
+                generated_base_names = set()
+                for result in self._cached_playlists.values():
+                    name = (result or {}).get("playlist_name")
+                    if name:
+                        safe = self.playlists._safe_name(name)
+                        generated_base_names.add(safe.lower())
+                        generated_names.add(safe + ".m3u8")
+                if wav_root and os.path.isdir(wav_root):
+                    for entry in os.scandir(wav_root):
+                        if entry.is_dir():
+                            safe = self.playlists._safe_name(entry.name)
+                            generated_base_names.add(safe.lower())
+                            generated_names.add(safe + ".m3u8")
+
+                # Remove bridge WAV/cache tree.
+                try:
+                    if wav_root and os.path.isdir(wav_root):
+                        shutil.rmtree(wav_root, ignore_errors=True)
+                        os.makedirs(wav_root, exist_ok=True)
+                        print(f"[Bridge] Cleared WAV/cache root: {wav_root}")
+                except Exception as exc:
+                    print(f"[Bridge] Failed clearing WAV/cache root: {exc}")
+
+                # Remove bridge-generated playlists from AIMP PLS dir.
+                removed_pls = 0
+                try:
+                    if pls_dir and os.path.isdir(pls_dir):
+                        def canonical_base(raw_name: str) -> str:
+                            name = (raw_name or "").strip().lower()
+                            if name.endswith(".aimppl4"):
+                                name = name[:-8]
+                            if name.endswith(".m3u8"):
+                                name = name[:-5]
+                            while name.endswith(")") and "(" in name:
+                                left = name.rfind("(")
+                                maybe_num = name[left + 1:-1].strip()
+                                if maybe_num.isdigit():
+                                    name = name[:left].rstrip()
+                                    continue
+                                break
+                            return name
+
+                        for fname in generated_names:
+                            fpath = os.path.join(pls_dir, fname)
+                            if os.path.exists(fpath):
+                                try:
+                                    os.remove(fpath)
+                                    removed_pls += 1
+                                except Exception:
+                                    pass
+                        # Also remove matching AIMP playlist files (.aimppl4/.m3u8),
+                        # including duplicate suffix variants like "name (2).aimppl4".
+                        for entry in os.scandir(pls_dir):
+                            if not entry.is_file():
+                                continue
+                            lower = entry.name.lower()
+                            if not (lower.endswith(".m3u8") or lower.endswith(".aimppl4")):
+                                continue
+                            base = canonical_base(os.path.splitext(entry.name)[0])
+                            if base in generated_base_names:
+                                try:
+                                    os.remove(entry.path)
+                                    removed_pls += 1
+                                except Exception:
+                                    pass
+                        print(f"[Bridge] Cleared playlist files: {removed_pls}")
+                except Exception as exc:
+                    print(f"[Bridge] Failed clearing playlist files: {exc}")
+
+                # Remove bridge progress marker.
+                try:
+                    progress_path = os.path.join(os.getcwd(), "bridge_progress.json")
+                    if os.path.exists(progress_path):
+                        os.remove(progress_path)
+                except Exception:
+                    pass
+
+                # Reset runtime maps/state.
+                self._cached_playlists.clear()
+                self._track_map.clear()
+                self._track_id_to_wav.clear()
+                self._track_id_to_playlist_id.clear()
+                self._playlist_loaded = False
+                self._current_m3u8 = None
+                self._last_track_id = None
+                self._last_playlist_id = None
+                self._clear_pending_aimp_click()
+                self.hook.set_track_map({}, None)
+                self.aimp._loaded_playlist_files.clear()
+                self.aimp._known_playlist_names.clear()
+
+            print("[Bridge] Clear-all complete. Use 'Sync playlist' to rebuild fresh files.")
+        finally:
+            self._clear_in_progress = False
+
+    def _resync_playlist_async(self, playlist_id: str):
+        if self._resync_in_flight or self._clear_in_progress:
+            return
+
+        def run():
+            self._resync_in_flight = True
+            try:
+                result = self._sync_playlist_id(playlist_id, force=True)
+                if result:
+                    self._activate_playlist_result(result, allow_create=True)
+                    print(f"[Bridge] Auto-resync completed for playlist {playlist_id[:8]}...")
+            finally:
+                self._resync_in_flight = False
+
+        threading.Thread(target=run, name="AutoPlaylistResync", daemon=True).start()
 
     def _on_aimp_click(self, track_id: str, playlist_uri: str | None):
-        print(f"[Bridge] AIMP click registered for track {track_id[:8]}...")
+        suffix = f", playlist={playlist_uri.split(':')[-1][:8]}..." if playlist_uri else ""
+        print(f"[Bridge] AIMP click registered for track {track_id[:8]}...{suffix}")
         self._aimp_click_serial += 1
         self._aimp_initiated_track_id = track_id
         self._aimp_initiated_playlist_id = (
@@ -111,6 +286,56 @@ class SpotifyAIMPBridge:
             return None
         return self._track_id_to_wav.get(track_id)
 
+    def _playlist_id_for_track(self, track_id: str | None) -> str | None:
+        if not track_id:
+            return None
+        direct = self._track_id_to_playlist_id.get(track_id)
+        if direct:
+            return direct
+        wav_path = self._track_id_to_wav.get(track_id)
+        if not wav_path:
+            return None
+        entry = self._track_map.get(wav_path.lower())
+        if isinstance(entry, dict):
+            pid = entry.get("playlist_id")
+            if pid:
+                self._track_id_to_playlist_id[track_id] = pid
+                return pid
+        return None
+
+    def _ensure_playlist_for_track(self, track_id: str | None, allow_create: bool = False) -> bool:
+        pid = self._playlist_id_for_track(track_id)
+        if not pid:
+            return False
+
+        wav_path = self._expected_wav_for_track(track_id)
+        if not wav_path:
+            return False
+
+        current = self.aimp.get_current_track_filename() or ""
+        target_dir = os.path.dirname(wav_path).lower()
+        current_dir = os.path.dirname(current).lower() if current else ""
+
+        # Fast-path: already in the right playlist folder/tab context.
+        # Avoid reloading the same playlist every tick.
+        if current_dir and current_dir == target_dir:
+            return True
+
+        cached = self._cached_playlists.get(pid)
+        if not cached:
+            return False
+        m3u8 = cached.get("m3u8_path")
+        if not m3u8 or not os.path.exists(m3u8):
+            repaired = self.playlists.repair_cached_playlist(cached)
+            self._store_playlist_result(repaired)
+            cached = repaired
+        self._activate_playlist_result(cached, allow_create=allow_create)
+
+        # Ensure AIMP switched into the expected playlist folder.
+        current = self.aimp.get_current_track_filename() or ""
+        current_dir = os.path.dirname(current).lower() if current else ""
+        return bool(current_dir and current_dir == target_dir)
+
     def _aimp_matches_track(self, track_id: str | None) -> bool:
         expected = self._expected_wav_for_track(track_id)
         if not expected:
@@ -121,10 +346,26 @@ class SpotifyAIMPBridge:
         return current == expected.lower()
 
     def _maybe_realign_aimp(self, track_id: str | None) -> bool:
+        # Never realign while bridge/hook suppression is active.
+        if time.monotonic() < self.hook._suppress_until:
+            return False
+
+        # If an AIMP click is pending and we're waiting for Spotify to land on that
+        # clicked track, don't force realign to an older Spotify snapshot.
+        if self._pending_aimp_click_active():
+            pending = self._aimp_initiated_track_id
+            if pending and track_id != pending:
+                return False
+
         expected = self._expected_wav_for_track(track_id)
         if not expected or not os.path.exists(expected) or not self.aimp.is_running():
             return False
         if self._aimp_matches_track(track_id):
+            return False
+
+        # Ensure correct playlist tab is active before jumping the file,
+        # otherwise AIMP may add the file into whatever tab is currently active.
+        if not self._ensure_playlist_for_track(track_id, allow_create=False):
             return False
 
         now = time.monotonic()
@@ -138,13 +379,26 @@ class SpotifyAIMPBridge:
             print(f"  File   : {os.path.basename(expected)}")
             print("  Result : OK")
             self.hook.notify_track_loaded(expected)
+        else:
+            print("=== AIMP REALIGN =================================")
+            print(f"  File   : {os.path.basename(expected)}")
+            print("  Result : FAILED")
         return ok
 
     def _reconcile_to_aimp(self, spotify_state: dict) -> bool:
         track_id = spotify_state.get("track_id")
         wav_path = self._expected_wav_for_track(track_id)
-        if not wav_path or not os.path.exists(wav_path) or not self.aimp.is_running():
+        if not wav_path or not os.path.exists(wav_path):
+            print("=== PRESENCE SYNC =================================")
+            print("  Source : Spotify -> AIMP")
+            print("  Result : Track not cached locally yet; skipping reconcile")
             return False
+        pid = self._playlist_id_for_track(track_id)
+        cached = self._cached_playlists.get(pid) if pid else None
+        if cached:
+            print(f"  Playlist : {cached.get('playlist_name') or pid[:8]}")
+            self._activate_playlist_result(cached, allow_create=True)
+            time.sleep(0.8)
 
         print("=== PRESENCE SYNC =================================")
         print("  Source : Spotify -> AIMP")
@@ -201,7 +455,8 @@ class SpotifyAIMPBridge:
         print("=== PRESENCE SYNC =================================")
         print("  Source : AIMP -> Spotify")
 
-        self.spotify.play_uri(uri, entry.get("playlist_uri"))
+        if not self.spotify.play_uri(uri, entry.get("playlist_uri")):
+            return False
         time.sleep(0.35)
 
         aimp_pos = self.aimp.get_player_position()
@@ -303,56 +558,46 @@ class SpotifyAIMPBridge:
     def _restore_cached_playlists_to_aimp(self):
         if not self.aimp.is_running():
             return
-
-        restored_any = False
-        for result in self._cached_playlists.values():
+        # Do not bulk-load all cached playlists on startup; that creates duplicate tabs.
+        # Only ensure the currently active Spotify playlist (if any) is present.
+        current_pid = self._get_current_playlist_id()
+        if not current_pid:
+            return
+        result = self._cached_playlists.get(current_pid)
+        if result:
             result = self.playlists.repair_cached_playlist(result)
-            m3u8 = result.get("m3u8_path")
-            name = result.get("playlist_name")
-            if not m3u8 or not os.path.exists(m3u8):
-                continue
-            if self.aimp.load_playlist(m3u8, name, allow_create=True):
-                restored_any = True
-
-        # Fallback: if bridge metadata is missing, restore every saved AIMP playlist file.
-        if restored_any:
-            return
-
-        pls_dir = getattr(self.playlists, "pls_dir", None)
-        if not pls_dir or not os.path.isdir(pls_dir):
-            return
-
-        for entry in sorted(os.scandir(pls_dir), key=lambda item: item.name.lower()):
-            if not entry.is_file() or not entry.name.lower().endswith(".m3u8"):
-                continue
-            playlist_name = os.path.splitext(entry.name)[0]
-            self.aimp.load_playlist(entry.path, playlist_name, allow_create=True)
+            self._store_playlist_result(result)
+            self._activate_playlist_result(result, allow_create=False)
 
     def _initial_sync(self):
         time.sleep(2)
         self._report_progress(0, 100, "Restoring cached playlists...")
 
-        restored = self.playlists.load_cached_playlists()
-        for result in restored:
-            result = self.playlists.repair_cached_playlist(result)
-            self._store_playlist_result(result)
+        with self._sync_op_lock:
+            restored = self.playlists.load_cached_playlists()
+            for result in restored:
+                result = self.playlists.repair_cached_playlist(result)
+                self._store_playlist_result(result)
 
-        result = self.playlists.sync_current_playlist(on_progress=self._on_sync_progress)
-        if result:
-            self._store_playlist_result(result)
-            self._last_playlist_id = result.get("playlist_uri", "").split(":")[-1] or self._get_current_playlist_id()
-            self._activate_playlist_result(result, allow_create=False)
-            print(f"[Bridge] Playlist ready: {result['playlist_name']}")
-        else:
+            if self._clear_in_progress:
+                print("[Bridge] Initial sync paused: clear-all in progress.")
+                return
             self._last_playlist_id = self._get_current_playlist_id()
             cached = self._cached_playlists.get(self._last_playlist_id) if self._last_playlist_id else None
             if cached:
                 cached = self.playlists.repair_cached_playlist(cached)
                 self._store_playlist_result(cached)
-                self._activate_playlist_result(cached, allow_create=True)
+                self._activate_playlist_result(cached, allow_create=False)
                 print(f"[Bridge] Playlist ready from cache: {cached['playlist_name']}")
             else:
-                print("[Bridge] No syncable playlist context")
+                result = self.playlists.sync_current_playlist(on_progress=self._on_sync_progress)
+                if result:
+                    self._store_playlist_result(result)
+                    self._last_playlist_id = result.get("playlist_uri", "").split(":")[-1] or self._get_current_playlist_id()
+                    self._activate_playlist_result(result, allow_create=True)
+                    print(f"[Bridge] Playlist ready: {result['playlist_name']}")
+                else:
+                    print("[Bridge] No syncable playlist context")
 
         self._report_progress(100, 100, "Sync complete!")
         time.sleep(1)
@@ -362,8 +607,7 @@ class SpotifyAIMPBridge:
         self._sync_ready.set()
 
     def _on_sync_progress(self, current, total, title):
-        percent = int((current / total) * 100) if total else 0
-        self._report_progress(percent, 100, f"Syncing: {title}")
+        self._report_progress(current, total, f"Syncing: {title}")
 
     def _report_progress(self, current, total, message):
         try:
@@ -376,7 +620,7 @@ class SpotifyAIMPBridge:
                 }, f)
         except Exception:
             pass
-        self.progress_window.update(current, total, message)
+        self.window.update_progress(current, total, message)
 
     def _store_playlist_result(self, result: dict):
         if not result:
@@ -385,13 +629,28 @@ class SpotifyAIMPBridge:
         playlist_id = result.get("playlist_id") or (
             playlist_uri.split(":")[-1] if playlist_uri else None
         )
+        was_cached = playlist_id in self._cached_playlists if playlist_id else False
         if playlist_id:
             self._cached_playlists[playlist_id] = result
 
         self._playlist_loaded = True
-        self._track_map.update(result.get("track_map", {}))
-        self._track_id_to_wav.update(result.get("track_id_to_wav", {}))
+        result_track_map = result.get("track_map", {})
+        result_track_id_to_wav = result.get("track_id_to_wav", {})
+        self._track_map.update(result_track_map)
+        self._track_id_to_wav.update(result_track_id_to_wav)
+        for tid, wav in result_track_id_to_wav.items():
+            entry = result_track_map.get((wav or "").lower())
+            if isinstance(entry, dict):
+                pid = entry.get("playlist_id")
+                if pid:
+                    self._track_id_to_playlist_id[tid] = pid
         self.hook.set_track_map(self._track_map, playlist_uri)
+        print("")
+        print("=== PLAYLIST CACHED =============================")
+        print(f"  Name   : {result.get('playlist_name', 'Unknown')}")
+        print(f"  ID     : {(playlist_id or 'none')[:8]}...")
+        print(f"  Tracks : {len(result_track_id_to_wav)}")
+        print(f"  Mode   : {'Updated' if was_cached else 'Added'}")
 
     def _activate_playlist_result(self, result: dict, allow_create: bool = True):
         if not result:
@@ -401,26 +660,60 @@ class SpotifyAIMPBridge:
         name = result.get("playlist_name")
         self._current_m3u8 = m3u8
 
-        if not m3u8 or not self.aimp.is_running():
+        if not self.aimp.is_running():
             return
 
-        if self.aimp.load_playlist(m3u8, name, allow_create=allow_create):
-            self.hook.suppress(3.0)
-
-    def _sync_playlist_id(self, playlist_id: str) -> dict:
-        self._report_progress(0, 100, "Playlist changed, re-syncing...")
-        result = self.playlists.sync_playlist_by_id(playlist_id, on_progress=self._on_sync_progress)
-        if not result:
-            cached = self._cached_playlists.get(playlist_id)
-            if cached:
-                print(f"[Bridge] Using cached playlist for {playlist_id[:8]}...")
-                result = self.playlists.repair_cached_playlist(cached)
-        if result:
+        if not m3u8 or not os.path.exists(m3u8):
+            result = self.playlists.repair_cached_playlist(result)
             self._store_playlist_result(result)
-        self._report_progress(100, 100, "Sync complete!")
-        time.sleep(1)
-        self._report_progress(None, None, "")
-        return result
+            m3u8 = result.get("m3u8_path")
+            name = result.get("playlist_name")
+            self._current_m3u8 = m3u8
+            if not m3u8 or not os.path.exists(m3u8):
+                return
+
+        # Always prefer activating an existing tab first to avoid duplicate AIMP playlists.
+        activated = self.aimp.load_playlist(m3u8, name, allow_create=False)
+        if not activated and allow_create:
+            activated = self.aimp.load_playlist(m3u8, name, allow_create=True)
+
+        if activated:
+            print("=== AIMP PLAYLIST ================================")
+            print(f"  Action : Activated playlist tab")
+            print(f"  Name   : {name or 'Unknown'}")
+            print(f"  File   : {os.path.basename(m3u8)}")
+            self.hook.suppress(3.0)
+        else:
+            print("=== AIMP PLAYLIST ================================")
+            print("  Action : Playlist tab not activated")
+            print(f"  Name   : {name or 'Unknown'}")
+            print(f"  File   : {os.path.basename(m3u8)}")
+
+    def _sync_playlist_id(self, playlist_id: str, force: bool = False) -> dict:
+        if self._clear_in_progress:
+            print("[Bridge] Sync skipped: clear-all in progress.")
+            return {}
+        with self._sync_op_lock:
+            if not force:
+                cached = self._cached_playlists.get(playlist_id)
+                if cached:
+                    repaired = self.playlists.repair_cached_playlist(cached)
+                    self._store_playlist_result(repaired)
+                    print(f"[Bridge] Using cached playlist (no re-sync): {repaired.get('playlist_name', playlist_id)}")
+                    return repaired
+            self._report_progress(0, 100, "Playlist changed, re-syncing...")
+            result = self.playlists.sync_playlist_by_id(playlist_id, on_progress=self._on_sync_progress)
+            if not result:
+                cached = self._cached_playlists.get(playlist_id)
+                if cached:
+                    print(f"[Bridge] Using cached playlist for {playlist_id[:8]}...")
+                    result = self.playlists.repair_cached_playlist(cached)
+            if result:
+                self._store_playlist_result(result)
+            self._report_progress(100, 100, "Sync complete!")
+            time.sleep(1)
+            self._report_progress(None, None, "")
+            return result
 
     def _hook_watcher(self):
         while self._running:
@@ -472,7 +765,7 @@ class SpotifyAIMPBridge:
             self._last_playlist_id = current_pl_id
             result = self._sync_playlist_id(current_pl_id)
             if result:
-                self._activate_playlist_result(result, allow_create=not aimp_initiated_change)
+                self._activate_playlist_result(result, allow_create=True)
 
             if was_playing and not aimp_initiated_change:
                 self.spotify.play()
@@ -482,7 +775,13 @@ class SpotifyAIMPBridge:
                     self._last_track_id = new_state["track_id"]
                     self.hook.notify_track_loaded()
 
-        pending_target = self._aimp_initiated_track_id if pending_aimp_click else None
+            # Important: stop this tick here. The `state` snapshot above is stale
+            # after a playlist-sync roundtrip and can cause wrong-track realigns.
+            return
+
+        # Re-evaluate pending click right before realign logic; clicks can arrive
+        # mid-tick from hook thread.
+        pending_target = self._aimp_initiated_track_id if self._pending_aimp_click_active() else None
         if pending_target and state["track_id"] != pending_target:
             print("")
             print("=== AIMP CLICK PENDING ===========================")
@@ -498,6 +797,7 @@ class SpotifyAIMPBridge:
 
         print("")
         print("=== SPOTIFY =====================================")
+        print("  Event  : New Spotify track detected")
         print(f"  Track  : {state['title']}")
         print(f"  Artist : {state['artist']}")
         print(f"  Album  : {state['album']}")
@@ -523,6 +823,11 @@ class SpotifyAIMPBridge:
 
         wav_path = self._track_id_to_wav.get(tid)
         if self._playlist_loaded and wav_path and os.path.exists(wav_path):
+            if not self._ensure_playlist_for_track(tid, allow_create=False):
+                print("=== AIMP ========================================")
+                print("  Action : Skipped jump - target playlist tab not active yet")
+                print(f"  File   : {os.path.basename(wav_path)}")
+                return
             ok = self.aimp.play_wav_in_playlist(wav_path)
             print("=== AIMP ========================================")
             print("  Action : Jump to playlist track")
@@ -535,6 +840,11 @@ class SpotifyAIMPBridge:
             print("=== AIMP ========================================")
             print("  Action : No jump - track not in playlist map")
             print(f"  Map    : {len(self._track_id_to_wav)} tracks, ID={state['track_id'][:8]}...")
+            now = time.monotonic()
+            if current_pl_id and now - self._last_missing_track_resync_attempt > 30.0:
+                self._last_missing_track_resync_attempt = now
+                print(f"[Bridge] Missing track map entry, scheduling auto-resync for {current_pl_id[:8]}...")
+                self._resync_playlist_async(current_pl_id)
 
         self._last_track_id = tid
 
@@ -631,8 +941,13 @@ class SpotifyAIMPBridge:
 
                 if time.monotonic() < self.hook._suppress_until:
                     match = "SYNCING..."
+                    self._status_mismatch_streak = 0
                 else:
                     match = "IN SYNC" if is_sync else "MISMATCH"
+                    if is_sync:
+                        self._status_mismatch_streak = 0
+                    else:
+                        self._status_mismatch_streak += 1
 
                 print("")
                 print(f"SPOTIFY [{sp_status}] {sp_title[:55]}")
@@ -658,6 +973,10 @@ class SpotifyAIMPBridge:
 
     def _cleanup_cache(self):
         root = self.metadata.root
+        norm = os.path.abspath(root).replace("/", "\\").lower()
+        if not norm.endswith("\\spotifybridge"):
+            print(f"[Bridge] Cleanup skipped (unsafe cache root): {root}")
+            return
         try:
             for fname in os.listdir(root):
                 fpath = os.path.join(root, fname)

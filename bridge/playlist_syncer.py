@@ -29,6 +29,9 @@ class PlaylistSyncer:
         print(f"[Playlists] PLS dir:  {self.pls_dir}")
         print(f"[Playlists] WAV root: {self.wav_root}")
 
+    def _playlist_m3u8_path(self, playlist_name: str) -> str:
+        return os.path.abspath(os.path.join(self.pls_dir, self._safe_name(playlist_name) + ".m3u8"))
+
     # ── Public ─────────────────────────────────────────────────────────────────
 
     def sync_current_playlist(self,
@@ -77,6 +80,7 @@ class PlaylistSyncer:
         if pl_images:
             pl_cover = self._spotify.get_cover_art(pl_images[0].get("url"))
             if pl_cover:
+                os.makedirs(wav_dir, exist_ok=True)
                 with open(os.path.join(wav_dir, "folder.jpg"), "wb") as f:
                     f.write(pl_cover)
 
@@ -136,11 +140,13 @@ class PlaylistSyncer:
 
                 if os.path.exists(wav_path):
                     self._meta._tag(wav_path, title, artist, album_name, i + 1, cover)
+                    print(f"[Playlists] Track synced ({i + 1}/{total}): {artist} - {title} [retagged]")
                 else:
                     self._meta.write_track(
                         wav_path, title, artist, album_name,
                         duration_ms, i + 1, cover
                     )
+                    print(f"[Playlists] Track synced ({i + 1}/{total}): {artist} - {title} [created]")
 
             track_map[wav_path.lower()] = {
                 "uri": uri,
@@ -159,7 +165,7 @@ class PlaylistSyncer:
             if (i + 1) % 20 == 0:
                 print(f"[Playlists]   {i+1}/{total} tracks processed...")
 
-        m3u_path = os.path.join(self.pls_dir, safe + ".m3u8")
+        m3u_path = self._playlist_m3u8_path(name)
         with open(m3u_path, "w", encoding="utf-8") as f:
             f.write("\n".join(m3u_lines))
 
@@ -245,9 +251,7 @@ class PlaylistSyncer:
                 track_id_to_wav[track_id] = os.path.join(wav_dir, wav_name)
 
             playlist_name = meta.get("playlist_name") or entry.name
-            m3u8_path = meta.get("m3u8_path") or os.path.join(
-                self.pls_dir, self._safe_name(playlist_name) + ".m3u8"
-            )
+            m3u8_path = self._playlist_m3u8_path(playlist_name)
 
             cached.append({
                 "playlist_name": playlist_name,
@@ -327,9 +331,7 @@ class PlaylistSyncer:
             m3u_lines.append(f"#EXTINF:{duration_ms // 1000},{artist} - {title}")
             m3u_lines.append(wav_path)
 
-        m3u8_path = cached.get("m3u8_path") or os.path.join(
-            self.pls_dir, self._safe_name(playlist_name) + ".m3u8"
-        )
+        m3u8_path = self._playlist_m3u8_path(playlist_name)
         with open(m3u8_path, "w", encoding="utf-8") as f:
             f.write("\n".join(m3u_lines))
 
