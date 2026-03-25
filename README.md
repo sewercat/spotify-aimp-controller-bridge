@@ -144,7 +144,7 @@ On first launch:
 
 ---
 
-### 🎮 Controls
+### Controls
 
 | Action     | Method                    |
 | ---------- | ------------------------- |
@@ -165,7 +165,7 @@ dist\SpotifyAIMPBridge.exe
 
 ---
 
-## ⚙️ Configuration (config.ini)
+## Configuration (config.ini)
 
 Generated automatically on first run.
 
